@@ -1,0 +1,11 @@
+# Real env file — never commit this
+.env
+
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
