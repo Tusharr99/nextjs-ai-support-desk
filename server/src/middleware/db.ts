@@ -17,6 +17,7 @@ export async function ensureDbConnected(): Promise<boolean> {
   if (!mongoUri) return false;
 
   try {
+    mongoose.set('bufferTimeoutMS', 2000); // Fail fast instead of hanging 30s
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 5000,
       connectTimeoutMS: 6000,

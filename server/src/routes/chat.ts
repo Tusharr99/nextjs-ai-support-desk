@@ -8,7 +8,7 @@ import { ensureDbConnected } from '../middleware/db';
 const router = Router();
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
-const SIMILARITY_THRESHOLD = 0.4;
+const SIMILARITY_THRESHOLD = 0.35;
 const TOP_K_RESULTS = 3;
 
 // ─── Cohere client (singleton) ─────────────────────────────────────────────────
@@ -49,20 +49,78 @@ router.post('/chat', async (req: Request, res: Response): Promise<void> => {
 
     // ── Session ───────────────────────────────────────────────────────────────
     if (dbReady) {
-      let session = null;
-      if (sessionId && mongoose.Types.ObjectId.isValid(sessionId))
-        session = await ChatSession.findById(sessionId);
-      if (!session)
-        session = await ChatSession.create({ status: 'active', summary: message.slice(0, 100) });
-      currentSessionId = (session as { _id: mongoose.Types.ObjectId })._id.toString();
+      try {
+        let session = null;
+        if (sessionId && mongoose.Types.ObjectId.isValid(sessionId))
+          session = await ChatSession.findById(sessionId);
+        if (!session)
+          session = await ChatSession.create({ status: 'active', summary: message.slice(0, 100) });
+        currentSessionId = (session as { _id: mongoose.Types.ObjectId })._id.toString();
+      } catch (err) {
+        console.error('Session DB Error, falling back to memory:', err);
+        currentSessionId = sessionId || `temp-${Date.now()}`;
+      }
     } else {
       currentSessionId = sessionId || `temp-${Date.now()}`;
     }
 
     sendEvent('session', { sessionId: currentSessionId });
 
-    if (dbReady) {
-      await Message.create({ sessionId: currentSessionId, sender: 'user', text: message, citations: [] });
+    if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId)) {
+      try {
+        await Message.create({ sessionId: currentSessionId, sender: 'user', text: message, citations: [] });
+      } catch (err) {
+        console.error('Failed to log user message:', err);
+      }
+    }
+
+    // ── Intent Classifier ─────────────────────────────────────────────────────
+    let intent = 'TECHNICAL_QUERY';
+    try {
+      const routerPrompt = `You are an intent classifier for a Next.js AI support desk. Categorize the user's message into one of three intents:
+- "SMALL_TALK": Greetings, casual conversation, who you are, or vague/general requests for help (e.g., "can you help me", "i need help", "how do i use this bot?", "are you there?").
+- "TECHNICAL_QUERY": Technical help, code examples related to Next.js/React.
+- "OUT_OF_SCOPE": Completely unrelated to software development.
+Respond with a JSON object in this format: {"intent": "..."}`;
+
+      const classifyRes = await cohere.chat({
+        model: 'command-r-08-2024',
+        message: message,
+        preamble: routerPrompt,
+        // @ts-ignore
+        responseFormat: { type: 'json_object' }
+      });
+      
+      const jsonStr = classifyRes.text || '{}';
+      const parsed = JSON.parse(jsonStr);
+      if (parsed.intent) intent = parsed.intent;
+    } catch (err) {
+      console.error('Classification error:', err);
+      // fallback to technical query on error
+    }
+
+    if (intent === 'SMALL_TALK') {
+      const reply = "I sure can! I'm an expert on Next.js, React, routing, server components, and configuration. What specific question or issue can I help you with today?";
+      sendEvent('token', { content: reply });
+      sendEvent('done', { citations: [], sessionId: currentSessionId });
+      
+      if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId)) {
+        try { await Message.create({ sessionId: currentSessionId, sender: 'ai', text: reply, citations: [], similarityScore: 1 }); } catch(e) {}
+      }
+      res.end();
+      return;
+    }
+
+    if (intent === 'OUT_OF_SCOPE') {
+      const reply = "I am specifically designed to assist with Next.js technical support and cannot help with non-development questions.";
+      sendEvent('token', { content: reply });
+      sendEvent('done', { citations: [], sessionId: currentSessionId });
+      
+      if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId)) {
+        try { await Message.create({ sessionId: currentSessionId, sender: 'ai', text: reply, citations: [], similarityScore: 1 }); } catch(e) {}
+      }
+      res.end();
+      return;
     }
 
     // ── Embed query ───────────────────────────────────────────────────────────
@@ -112,20 +170,24 @@ router.post('/chat', async (req: Request, res: Response): Promise<void> => {
 
     // ── Escalation ────────────────────────────────────────────────────────────
     if (isEscalated) {
-      if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId))
-        await ChatSession.findByIdAndUpdate(currentSessionId, { status: 'escalated' });
-
       const escalationText =
         "I don't have enough information in the documentation to confidently answer your question. " +
         'Your query has been escalated to our human support team who will review it shortly.';
 
-      sendEvent('escalated', { message: 'Escalated to human support.' });
+      // Await all DB operations BEFORE sending any responses to the client
       if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId)) {
-        await Message.create({
-          sessionId: currentSessionId, sender: 'ai',
-          text: escalationText, citations: [], similarityScore: topScore,
-        });
+        try { 
+          await ChatSession.findByIdAndUpdate(currentSessionId, { status: 'escalated' }); 
+          await Message.create({
+            sessionId: currentSessionId, sender: 'ai',
+            text: escalationText, citations: [], similarityScore: topScore,
+          });
+        } catch(e) {
+          console.error('Failed to update DB for escalation:', e);
+        }
       }
+
+      sendEvent('escalated', { message: 'Escalated to human support.' });
       sendEvent('token', { content: escalationText });
       sendEvent('done', { citations: [], sessionId: currentSessionId });
       res.end();
@@ -134,16 +196,18 @@ router.post('/chat', async (req: Request, res: Response): Promise<void> => {
 
     // ── Stream chat response via Cohere command-r ─────────────────────────────
     const systemPrompt =
-      `You are an expert Next.js Technical Support Engineer. ` +
-      `Answer the user's question accurately using ONLY the provided documentation context. ` +
-      `Be concise, technical, and helpful. Format code with markdown code blocks.\n\n` +
+      `You are an expert Next.js Technical Support Engineer. Answer the user's question using ONLY the provided documentation context below.\n` +
+      `- You MAY synthesize and explain concepts found in the context, even if the exact phrase isn't present verbatim.\n` +
+      `- Use clear, concise language with markdown formatting and code blocks where helpful.\n` +
+      `- If the context genuinely contains NO relevant information at all to answer the question, reply with ONLY: 'I don't have enough information in the documentation to confidently answer your question. Your query has been escalated to our human support team who will review it shortly.'\n` +
+      `- Do NOT make up APIs, features, or configurations not present in the context.\n\n` +
       `## Documentation Context:\n${contextText}`;
 
     const stream = await cohere.chatStream({
       model: 'command-r-08-2024',
       message,
       preamble: systemPrompt,
-      temperature: 0.2,
+      temperature: 0.1,
     });
 
     let fullResponse = '';
@@ -155,10 +219,20 @@ router.post('/chat', async (req: Request, res: Response): Promise<void> => {
     }
 
     if (dbReady && mongoose.Types.ObjectId.isValid(currentSessionId)) {
-      await Message.create({
-        sessionId: currentSessionId, sender: 'ai',
-        text: fullResponse, citations, similarityScore: topScore,
-      });
+      try {
+        await Message.create({
+          sessionId: currentSessionId, sender: 'ai',
+          text: fullResponse, citations, similarityScore: topScore,
+        });
+
+        // If the LLM strictly fell back to the escalation phrase, mark the session as escalated
+        if (fullResponse.includes("I don't have enough information")) {
+          await ChatSession.findByIdAndUpdate(currentSessionId, { status: 'escalated' });
+          console.log('Escalation saved to DB for session:', currentSessionId);
+        }
+      } catch (err) {
+        console.error('Failed to log AI response:', err);
+      }
     }
 
     sendEvent('done', { citations, sessionId: currentSessionId });
@@ -185,7 +259,7 @@ router.get('/sessions', async (_req: Request, res: Response): Promise<void> => {
 // ─── GET /api/sessions/:id/messages ───────────────────────────────────────────
 router.get('/sessions/:id/messages', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  if (!mongoose.Types.ObjectId.isValid(id)) { res.status(400).json({ error: 'Invalid session ID' }); return; }
+  if (!mongoose.Types.ObjectId.isValid(id)) { res.json({ messages: [], _warning: 'Invalid or temporary session ID' }); return; }
   const dbReady = await ensureDbConnected();
   if (!dbReady) { res.json({ messages: [], _warning: 'Database not connected' }); return; }
   try {

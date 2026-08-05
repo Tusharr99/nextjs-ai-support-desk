@@ -18,11 +18,18 @@ export default function Home() {
   // Load sessions on mount
   useEffect(() => {
     loadSessions();
+    // Restore session if we navigated away and back
+    const savedSessionId = localStorage.getItem('currentSessionId');
+    if (savedSessionId) {
+      handleSelectSession(savedSessionId);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Reload sessions after a message is streamed
   useEffect(() => {
     if (!streamState.isStreaming && streamState.currentSessionId) {
+      localStorage.setItem('currentSessionId', streamState.currentSessionId);
       loadSessions();
     }
   }, [streamState.isStreaming, streamState.currentSessionId]);
@@ -37,11 +44,13 @@ export default function Home() {
   };
 
   const handleNewChat = useCallback(() => {
+    localStorage.removeItem('currentSessionId');
     clearMessages();
   }, [clearMessages]);
 
   const handleSelectSession = useCallback(async (sessionId: string) => {
     try {
+      localStorage.setItem('currentSessionId', sessionId);
       clearMessages();
       const data = await fetchMessages(sessionId);
       const loadedMessages: UIMessage[] = (data.messages || []).map(
@@ -63,6 +72,9 @@ export default function Home() {
       setMessages(loadedMessages);
     } catch (err) {
       console.error('Failed to load session messages:', err);
+      // If we fail to fetch the session (e.g. invalid temp id or network error), clear it so we don't get stuck.
+      localStorage.removeItem('currentSessionId');
+      setMessages([]);
     }
   }, [clearMessages, setMessages]);
 
